@@ -106,8 +106,5 @@ colcon test --packages-select mapping
 
 ## License
 
-[Add your license information here]
 
 ## Author
-
-[Add author information here]
