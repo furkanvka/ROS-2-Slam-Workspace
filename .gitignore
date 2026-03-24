@@ -1,0 +1,55 @@
+# ROS 2 / Colcon
+build/
+install/
+log/
+.colcon/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+*.cmake
+!CMakeLists.txt
+
+# C++
+*.o
+*.obj
+*.so
+*.a
+*.lib
+*.dll
+*.dylib
+*.exe
+*.out
+*.app
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+
+# IDE - VS Code
+.vscode/
+*.code-workspace
+
+# IDE - CLion/JetBrains
+.idea/
+*.iml
+
+# IDE - Vim/Emacs
+*~
+*.swp
+*.swo
+*#
+
+# OS-specific
+.DS_Store
+Thumbs.db
+desktop.ini
