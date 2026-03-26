@@ -15,7 +15,7 @@ source install/setup.bash
 echo "🤖 Launching simulation..."
 ros2 launch clearpath_gz simulation.launch.py \
   x:=-3.3 y:=3.3 \
-  world:=/home/furkan/Documents/new/worlds/generated_maze \
+  world:=/home/furkan/Documents/map/worlds/generated_maze \
   rviz:=true\
   use_sim_time:=true &
 LAUNCH_PID=$!
@@ -25,8 +25,6 @@ LAUNCH_PID=$!
 ros2 run mapping Occupancy &
 MAPP=$!
 
-
-
 trap "echo '🛑 Durduruluyor...'; kill $LAUNCH_PID $MAPP 2>/dev/null; exit 0" SIGINT SIGTERM
 
-wait $LAUNCH_PID
+wait $LAUNCH_PID $MAPP
