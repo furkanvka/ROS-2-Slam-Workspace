@@ -5,40 +5,55 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# Bağımlılıklar
+# ─── Dependencies ─────────────────────────────
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 
-# Executable'lar
-add_executable(Occupancy src/Occupancy.cpp)
+# ─── Localization Node ───────────────────────
+add_executable(localization_node src/localization_node.cpp)
 
-# Include dizinleri
-target_include_directories(Occupancy PUBLIC
+target_include_directories(localization_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include/${PROJECT_NAME}>)
+  $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
+)
 
+target_compile_features(localization_node PUBLIC c_std_99 cxx_std_17)
 
-# Compiler standard
-target_compile_features(Occupancy PUBLIC c_std_99 cxx_std_17)
-
-# Dependencies (KRİTİK)
-ament_target_dependencies(Occupancy
+ament_target_dependencies(localization_node
   rclcpp
   geometry_msgs
   nav_msgs
   sensor_msgs
 )
 
-# Install
+# ─── Mapping Node ────────────────────────────
+add_executable(mapping_node src/mapping_node.cpp)
+
+target_include_directories(mapping_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
+)
+
+target_compile_features(mapping_node PUBLIC c_std_99 cxx_std_17)
+
+ament_target_dependencies(mapping_node
+  rclcpp
+  geometry_msgs
+  nav_msgs
+  sensor_msgs
+)
+
+# ─── Install ─────────────────────────────────
 install(TARGETS
-  Occupancy
+  localization_node
+  mapping_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# Test
+# ─── Test ────────────────────────────────────
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
