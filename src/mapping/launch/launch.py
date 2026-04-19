@@ -16,7 +16,6 @@ def generate_launch_description():
             'x': '-3.3',
             'y': '3.3',
             'world': '/home/furkan/Documents/map/worlds/generated_maze',
-            'rviz': 'true',
             'use_sim_time': 'true'
         }.items()
     )
@@ -38,8 +37,28 @@ def generate_launch_description():
         parameters=[{'use_sim_time': True}] 
     )
 
+    explorer_node = Node(
+        package='mapping',
+        executable='explorer_node',
+        name='explorer_node',
+        output='screen',
+        parameters=[{'use_sim_time': True}] 
+    )
+
+
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        # arguments=['-d', rviz_config_dir], # Config dosyan hazır olduğunda bu satırı açabilirsin
+        output='screen',
+        parameters=[{'use_sim_time': True}]
+    )
+
     return LaunchDescription([
         simulation_launch,
         localization_node,
-        mapping_node 
+        explorer_node,
+        mapping_node ,
+        rviz_node
     ])

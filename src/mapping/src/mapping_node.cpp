@@ -157,13 +157,13 @@ private:
     void initMap()
     {
         map_.header.frame_id = "odom";
-        map_.info.resolution = 0.1;
-        map_.info.width      = 200;
-        map_.info.height     = 200;
+        map_.info.resolution = 0.05;
+        map_.info.width      = 400;
+        map_.info.height     = 400;
         map_.info.origin.position.x = -10.0;
         map_.info.origin.position.y = -10.0;
         map_.info.origin.orientation.w = 1.0;
-        int N = 200 * 200;
+        int N = 400 * 400;
         map_.data.resize(N, -1);
         log_odds_.resize(N, 0.0f);
     }
