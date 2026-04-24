@@ -37,10 +37,18 @@ def generate_launch_description():
         parameters=[{'use_sim_time': True}] 
     )
 
-    explorer_node = Node(
+    frontier_node = Node(
         package='mapping',
-        executable='explorer_node',
-        name='explorer_node',
+        executable='frontier_node',
+        name='frontier_node',
+        output='screen',
+        parameters=[{'use_sim_time': True}] 
+    )
+
+    path_node = Node(
+        package='mapping',
+        executable='path_node',
+        name='path_node',
         output='screen',
         parameters=[{'use_sim_time': True}] 
     )
@@ -58,7 +66,8 @@ def generate_launch_description():
     return LaunchDescription([
         simulation_launch,
         localization_node,
-        explorer_node,
+        frontier_node,
+        path_node,
         mapping_node ,
         rviz_node
     ])

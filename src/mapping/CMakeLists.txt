@@ -46,27 +46,48 @@ ament_target_dependencies(mapping_node
   sensor_msgs
 )
 
-# ─── Explorer Node ────────────────────────────
-add_executable(explorer_node src/explorer_node.cpp)
 
-target_include_directories(explorer_node PUBLIC
+# ───  Node ────────────────────────path────
+add_executable(path_node src/path_node.cpp)
+
+target_include_directories(path_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
 )
 
-target_compile_features(explorer_node PUBLIC c_std_99 cxx_std_17)
+target_compile_features(path_node PUBLIC c_std_99 cxx_std_17)
 
-ament_target_dependencies(explorer_node
+ament_target_dependencies(path_node
   rclcpp
   geometry_msgs
   nav_msgs
+  sensor_msgs
+)
+
+
+# ─── Explorer Node ────────────────────────────
+add_executable(frontier_node src/frontier_node.cpp)
+
+target_include_directories(frontier_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
+)
+
+target_compile_features(frontier_node PUBLIC c_std_99 cxx_std_17)
+
+ament_target_dependencies(frontier_node
+  rclcpp
+  geometry_msgs
+  nav_msgs
+  sensor_msgs
 )
 
 # ─── Install ─────────────────────────────────
 install(TARGETS
   localization_node
   mapping_node
-  explorer_node
+  frontier_node
+  path_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
