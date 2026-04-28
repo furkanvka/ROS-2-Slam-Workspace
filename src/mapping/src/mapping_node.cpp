@@ -4,6 +4,7 @@
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include <vector>
 #include <cmath>
+#include <algorithm>
 
 struct Pose2D { double x, y, yaw; };
 
@@ -35,30 +36,30 @@ private:
     std::vector<float>           log_odds_;
     nav_msgs::msg::OccupancyGrid map_;
 
-    // Optimizasyon: Lidar açılarının önbelleğe alınması
     std::vector<float> scan_angles_cos_;
     std::vector<float> scan_angles_sin_;
     
-    // Optimizasyon: Aynı hücrenin aynı taramada birden fazla güncellenmesini engelleme
     std::vector<uint32_t> last_free_update_;
     uint32_t              scan_count_ = 0;
 
-    // ── Log-odds parametreleri ────────────────────────────────────────────
-    static constexpr float LOG_ODDS_HIT  =  0.9f;
-    static constexpr float LOG_ODDS_FREE = -0.4f;
-    static constexpr float LOG_ODDS_MIN  = -2.0f;
-    static constexpr float LOG_ODDS_MAX  =  5.0f;
+    // ── GÜNCELLENMİŞ LOG-ODDS PARAMETRELERİ ──────────────────────────────
+    // Hit değeri yüksek (duvar hemen oluşur), Free değeri düşük (zor silinir)
+    static constexpr float LOG_ODDS_HIT  =  1.5f;  
+    static constexpr float LOG_ODDS_FREE = -0.2f;  // Daha küçük bir negatif değer
+    static constexpr float LOG_ODDS_MIN  = -3.0f;  
+    static constexpr float LOG_ODDS_MAX  =  8.0f;  // Üst sınır yükseltildi (duvar doygunluğu)
 
     inline int8_t toOccupancy(float lo) const
     {
-        if (lo >  0.5f) return 100;
-        if (lo < -0.5f) return 0;
+        // Duvarın haritada kalma toleransını artırmak için eşik düşürüldü
+        if (lo > 0.3f)  return 100; 
+        if (lo < -1.0f) return 0;
         return -1;
     }
 
     inline void updateFree(int idx)
     {
-        if (last_free_update_[idx] == scan_count_) return; // Bu taramada zaten güncellendi
+        if (last_free_update_[idx] == scan_count_) return; 
         
         log_odds_[idx] = std::max(LOG_ODDS_MIN, log_odds_[idx] + LOG_ODDS_FREE);
         last_free_update_[idx] = scan_count_;
@@ -71,7 +72,6 @@ private:
         map_.data[idx] = toOccupancy(log_odds_[idx]);
     }
 
-    // Optimizasyon: std::function yerine Template kullanımı ile Inline genişletme
     template<typename Func>
     void bresenham(int x0, int y0, int x1, int y1, Func visit)
     {
@@ -113,9 +113,8 @@ private:
         while (dyaw >  M_PI) dyaw -= 2.0 * M_PI;
         while (dyaw < -M_PI) dyaw += 2.0 * M_PI;
 
-        if (std::hypot(dx, dy) < 0.01 && std::abs(dyaw) < 0.005) {
-            map_.header.stamp = now();
-            map_pub_->publish(map_);
+        // Çok küçük hareketlerde haritayı yormamak için güncelleme yapma
+        if (std::hypot(dx, dy) < 0.02 && std::abs(dyaw) < 0.01) {
             return;
         }
 
@@ -127,7 +126,6 @@ private:
         int rx = worldToGridX(pose_.x);
         int ry = worldToGridY(pose_.y);
 
-        // Lidar açılarını bir defaya mahsus hesapla ve sakla
         if (scan_angles_cos_.empty()) {
             scan_angles_cos_.reserve(msg->ranges.size());
             scan_angles_sin_.reserve(msg->ranges.size());
@@ -143,9 +141,15 @@ private:
 
         for (size_t i = 0; i < msg->ranges.size(); ++i) {
             float r = msg->ranges[i];
-            if (r < msg->range_min || r > msg->range_max || std::isnan(r)) continue;
+            
+            // Maksimum menzil sınırında "max_range" verisini boş alan güncellemek için kullanabiliriz
+            bool is_hit = true;
+            if (r >= msg->range_max || std::isnan(r)) {
+                r = msg->range_max - 0.1f; 
+                is_hit = false;
+            }
+            if (r < msg->range_min) continue;
 
-            // Önceden hesaplanmış Lidar açılarını robotun anlık rotasyonuyla birleştir
             double lx = r * scan_angles_cos_[i];
             double ly = r * scan_angles_sin_[i];
             
@@ -155,15 +159,17 @@ private:
             int gx = worldToGridX(wx);
             int gy = worldToGridY(wy);
 
+            // Yol boyu (Boş alan) güncellemesi
             bresenham(rx, ry, gx, gy, [&](int cx, int cy) {
                 if (cx < 0 || cx >= W || cy < 0 || cy >= H) return;
-                if (cx == gx && cy == gy) return; // Hedef nokta (hit) burada işlenmiyor
+                if (cx == gx && cy == gy && is_hit) return; 
                 
                 int idx = cy * W + cx;
                 updateFree(idx);
             });
 
-            if (gx >= 0 && gx < W && gy >= 0 && gy < H) {
+            // Engel (Hit) güncellemesi
+            if (is_hit && gx >= 0 && gx < W && gy >= 0 && gy < H) {
                 int idx = gy * W + gx;
                 updateHit(idx);
             }
@@ -184,10 +190,10 @@ private:
     {
         map_.header.frame_id = "odom";
         map_.info.resolution = 0.05;
-        map_.info.width      = 400;
-        map_.info.height     = 400;
-        map_.info.origin.position.x = -10.0;
-        map_.info.origin.position.y = -10.0;
+        map_.info.width      = 600; // Biraz daha geniş bir alan
+        map_.info.height     = 600;
+        map_.info.origin.position.x = -15.0;
+        map_.info.origin.position.y = -15.0;
         map_.info.origin.orientation.w = 1.0;
         
         int N = map_.info.width * map_.info.height;

@@ -91,9 +91,13 @@ public:
         // ── Parametreler ──────────────────────────────────────────────────────
         declare_parameter("max_linear_vel",     0.50);  // m/s
         declare_parameter("min_linear_vel",     0.08);  // m/s
-        declare_parameter("max_angular_vel",    1.20);  // rad/s
+        declare_parameter("max_angular_vel",    2.50);  // rad/s
         declare_parameter("max_acc_linear",     0.40);  // m/s²
         declare_parameter("max_acc_angular",    1.50);  // rad/s²
+
+        // Yeni Eklenti: Yerinde Dönüş Parametreleri
+        declare_parameter("turn_in_place_angle_rad", 0.52); // ~30 derece (Bu açıyı aşarsa durup döner)
+        declare_parameter("turn_in_place_vel",       1.20); // Yerinde dönüş hızı (rad/s)
 
         // Adaptive lookahead: L = base + k*v, clamp [min, max]
         declare_parameter("lookahead_base_m",   0.35);
@@ -106,7 +110,7 @@ public:
         declare_parameter("heading_tolerance",  0.10);  // rad, hedefe varınca hizalama
 
         // Obstacle / lidar
-        declare_parameter("stop_dist_m",        0.30);  // bu mesafenin altında dur
+        declare_parameter("stop_dist_m",        0.15);  // bu mesafenin altında dur
         declare_parameter("slow_dist_m",        0.70);  // bu mesafeden itibaren yavaşla
         declare_parameter("lateral_margin_m",   0.25);  // sol/sağ tehdit eşiği
         declare_parameter("steer_away_gain",    0.60);  // yanal tehditten kaçış kazancı
@@ -179,6 +183,7 @@ private:
     // ── Parametreler ──────────────────────────────────────────────────────────
     double max_lin_, min_lin_, max_ang_;
     double max_acc_v_, max_acc_w_;
+    double turn_in_place_angle_, turn_in_place_vel_;
     double lh_base_, lh_k_, lh_min_, lh_max_;
     double goal_tol_, heading_tol_;
     double stop_dist_, slow_dist_, lateral_margin_, steer_gain_;
@@ -186,25 +191,27 @@ private:
 
     void loadParams()
     {
-        max_lin_       = get_parameter("max_linear_vel").as_double();
-        min_lin_       = get_parameter("min_linear_vel").as_double();
-        max_ang_       = get_parameter("max_angular_vel").as_double();
-        max_acc_v_     = get_parameter("max_acc_linear").as_double();
-        max_acc_w_     = get_parameter("max_acc_angular").as_double();
-        lh_base_       = get_parameter("lookahead_base_m").as_double();
-        lh_k_          = get_parameter("lookahead_k").as_double();
-        lh_min_        = get_parameter("lookahead_min_m").as_double();
-        lh_max_        = get_parameter("lookahead_max_m").as_double();
-        goal_tol_      = get_parameter("goal_tolerance_m").as_double();
-        heading_tol_   = get_parameter("heading_tolerance").as_double();
-        stop_dist_     = get_parameter("stop_dist_m").as_double();
-        slow_dist_     = get_parameter("slow_dist_m").as_double();
-        lateral_margin_= get_parameter("lateral_margin_m").as_double();
-        steer_gain_    = get_parameter("steer_away_gain").as_double();
-        stuck_timeout_ = get_parameter("stuck_timeout_s").as_double();
-        stuck_dist_    = get_parameter("stuck_dist_m").as_double();
-        backup_dur_    = get_parameter("backup_duration_s").as_double();
-        backup_vel_    = get_parameter("backup_vel").as_double();
+        max_lin_             = get_parameter("max_linear_vel").as_double();
+        min_lin_             = get_parameter("min_linear_vel").as_double();
+        max_ang_             = get_parameter("max_angular_vel").as_double();
+        max_acc_v_           = get_parameter("max_acc_linear").as_double();
+        max_acc_w_           = get_parameter("max_acc_angular").as_double();
+        turn_in_place_angle_ = get_parameter("turn_in_place_angle_rad").as_double();
+        turn_in_place_vel_   = get_parameter("turn_in_place_vel").as_double();
+        lh_base_             = get_parameter("lookahead_base_m").as_double();
+        lh_k_                = get_parameter("lookahead_k").as_double();
+        lh_min_              = get_parameter("lookahead_min_m").as_double();
+        lh_max_              = get_parameter("lookahead_max_m").as_double();
+        goal_tol_            = get_parameter("goal_tolerance_m").as_double();
+        heading_tol_         = get_parameter("heading_tolerance").as_double();
+        stop_dist_           = get_parameter("stop_dist_m").as_double();
+        slow_dist_           = get_parameter("slow_dist_m").as_double();
+        lateral_margin_      = get_parameter("lateral_margin_m").as_double();
+        steer_gain_          = get_parameter("steer_away_gain").as_double();
+        stuck_timeout_       = get_parameter("stuck_timeout_s").as_double();
+        stuck_dist_          = get_parameter("stuck_dist_m").as_double();
+        backup_dur_          = get_parameter("backup_duration_s").as_double();
+        backup_vel_          = get_parameter("backup_vel").as_double();
     }
 
     // ── Callbacks ─────────────────────────────────────────────────────────────
@@ -263,8 +270,6 @@ private:
         cmd_pub_->publish(cmd);
     }
 
-    // Lidar engelinden kaynaklanan yanal sapma düzeltmesi
-    // Sağ taraf yakınsa → sola dön (+w), sol taraf yakınsa → sağa dön (−w)
     double lateralSteerCorrection() const
     {
         if (!scan_ready_) return 0.0;
@@ -276,7 +281,6 @@ private:
         return correction;
     }
 
-    // Frontal mesafeye göre hız faktörü  [0, 1]
     double obstacleVelFactor() const
     {
         if (!scan_ready_) return 1.0;
@@ -366,7 +370,6 @@ private:
         }
 
         // ── 5. Progress indeksini ilerlet ────────────────────────────────────
-        //    Robota en yakın waypoint'i bul, progress_idx_ geri gidemez
         {
             double best = 1e9;
             size_t best_i = progress_idx_;
@@ -392,7 +395,6 @@ private:
         double v_now     = ramp_.v_current;
         double lookahead = std::clamp(lh_base_ + lh_k_ * v_now, lh_min_, lh_max_);
 
-        // Engel varsa lookahead'i kısalt — temkinli davran
         if (scan_ready_ && sector_.front_wide_min < slow_dist_)
             lookahead = std::max(lh_min_, lookahead * (sector_.front_wide_min / slow_dist_));
 
@@ -411,36 +413,47 @@ private:
         double alpha = normAngle(std::atan2(dy, dx) - pose_.yaw);  // heading hatası
         double L     = std::hypot(dx, dy);                         // gerçek mesafe
 
-        // ── 9. Pure Pursuit curvature → (v, ω) ──────────────────────────────
-        //    κ = 2·sin(α) / L   →   ω = v · κ
-        double curvature = (L > 1e-3) ? (2.0 * std::sin(alpha) / L) : 0.0;
+        // ── 9. Hedefe Yönelme ve Hız Profili ─────────────────────────────────
+        double v_target = 0.0;
+        double w_target = 0.0;
 
-        // ── 10. Hız profili ──────────────────────────────────────────────────
+        // ** YENİ EKLENEN YERİNDE DÖNÜŞ MANTIĞI **
+        if (std::fabs(alpha) > turn_in_place_angle_) {
+            // Hedef ile aradaki açı çok büyük.
+            // İlerlemeyi durdur (v=0) ve sadece olduğu yerde hızlıca dön (w)
+            v_target = 0.0;
+            w_target = std::copysign(turn_in_place_vel_, alpha);
+            
+            // Robot dönme işlemini rampanın izin verdiği hızda ve ivmede pürüzsüzce yapacaktır.
+        } else {
+            // Açı hatası tolere edilebilir düzeyde, Pure Pursuit ile ilerlemeye devam et
+            double curvature = (L > 1e-3) ? (2.0 * std::sin(alpha) / L) : 0.0;
 
-        // a) Hedefe yaklaşırken yavaşla (lineer)
-        double v_target = max_lin_;
-        if (dist_to_goal < slow_dist_)
-            v_target = max_lin_ * std::max(0.2, dist_to_goal / slow_dist_);
+            v_target = max_lin_;
+            
+            // a) Hedefe yaklaşırken yavaşla
+            if (dist_to_goal < slow_dist_)
+                v_target = max_lin_ * std::max(0.2, dist_to_goal / slow_dist_);
 
-        // b) Yüksek eğride yavaşla — keskin köşe koruması
-        double abs_curv = std::fabs(curvature);
-        if (abs_curv > 0.5)
-            v_target *= std::max(0.3, 1.0 - 0.6 * (abs_curv - 0.5));
+            // b) Yüksek eğride yavaşla
+            double abs_curv = std::fabs(curvature);
+            if (abs_curv > 0.5)
+                v_target *= std::max(0.3, 1.0 - 0.6 * (abs_curv - 0.5));
 
-        // c) Frontal engel faktörü
-        double obs_factor = obstacleVelFactor();
-        v_target *= obs_factor;
+            // c) Frontal engel faktörü
+            double obs_factor = obstacleVelFactor();
+            v_target *= obs_factor;
 
-        // d) Minimum hız (durana kadar) — çok küçük hız robot motorunu zorlar
-        if (v_target > 0.0 && v_target < min_lin_) v_target = min_lin_;
+            // d) Minimum hız garantisi
+            if (v_target > 0.0 && v_target < min_lin_) v_target = min_lin_;
 
-        double w_target = v_target * curvature;
+            // e) Açısal hızı ayarla ve yanal duvardan kaçış ekle
+            w_target = v_target * curvature;
+            w_target += lateralSteerCorrection();
+            w_target = std::clamp(w_target, -max_ang_, max_ang_);
+        }
 
-        // e) Yanal duvardan kaçış — ω'ya eklenir
-        w_target += lateralSteerCorrection();
-        w_target  = std::clamp(w_target, -max_ang_, max_ang_);
-
-        // ── 11. Trapezoidal rampa ────────────────────────────────────────────
+        // ── 10. Trapezoidal rampa ────────────────────────────────────────────
         ramp_.step(v_target, w_target, max_acc_v_, max_acc_w_, DT);
         sendCmd(ramp_.v_current, ramp_.w_current);
 
