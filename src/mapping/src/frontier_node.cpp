@@ -9,11 +9,7 @@
 #include <algorithm>
 #include <unordered_set>
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
 struct Pose2D { double x, y, yaw; };
-
-// ─── Node ─────────────────────────────────────────────────────────────────────
 
 class FrontierNode : public rclcpp::Node
 {
@@ -22,44 +18,43 @@ public:
     {
         using std::placeholders::_1;
 
-        // ── Parameters (Sadece planlama ile ilgili olanlar) ───────────────────
-        declare_parameter("robot_radius_m",      0.40);  
-        declare_parameter("center_preference_m", 0.40);  
+        declare_parameter("robot_radius_m",      0.40);
+        declare_parameter("center_preference_m", 0.40);
+        declare_parameter("wall_penalty_weight",  15.0);
 
-        robot_radius_m_ = get_parameter("robot_radius_m").as_double();
-        center_pref_m_  = get_parameter("center_preference_m").as_double();
+        robot_radius_m_      = get_parameter("robot_radius_m").as_double();
+        center_pref_m_       = get_parameter("center_preference_m").as_double();
+        wall_penalty_weight_ = get_parameter("wall_penalty_weight").as_double();
 
-        // ── Subscriptions ────────────────────────────────────────────────────
         map_sub_  = create_subscription<nav_msgs::msg::OccupancyGrid>(
             "/map", 10, std::bind(&FrontierNode::mapCb,  this, _1));
         pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
             "/corrected_pose", 10, std::bind(&FrontierNode::poseCb, this, _1));
 
-        // ── Publishers ───────────────────────────────────────────────────────
-        path_pub_ = create_publisher<nav_msgs::msg::Path>("/plan", 10);
+        path_pub_    = create_publisher<nav_msgs::msg::Path>("/plan", 10);
+        costmap_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>("/frontier_costmap", 10);
 
-        // ── Timer (Planlama ağır işlemdir, 2 Hz yeterlidir) ──────────────────
         timer_ = create_wall_timer(
             std::chrono::milliseconds(500),
             std::bind(&FrontierNode::exploreLoop, this));
     }
 
 private:
-    // ── State ─────────────────────────────────────────────────────────────────
     nav_msgs::msg::OccupancyGrid::SharedPtr map_;
     Pose2D  pose_{};
-    bool    pose_ready_  = false;
+    bool    pose_ready_ = false;
 
-    std::vector<Pose2D> path_;                   
-    std::unordered_set<int> blacklisted_goals_;  
+    std::vector<Pose2D>     path_;
+    std::unordered_set<int> blacklisted_goals_;
 
-    // ROS handles
-    rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr   map_sub_;
+    rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr    map_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr               path_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr                path_pub_;
+    rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr       costmap_pub_;
+
     rclcpp::TimerBase::SharedPtr timer_;
 
-    double robot_radius_m_, center_pref_m_;
+    double robot_radius_m_, center_pref_m_, wall_penalty_weight_;
 
     // ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -77,44 +72,41 @@ private:
 
     // ── Grid helpers ──────────────────────────────────────────────────────────
 
-    int worldToGridX(double x) const { return static_cast<int>((x - map_->info.origin.position.x) / map_->info.resolution); }
-    int worldToGridY(double y) const { return static_cast<int>((y - map_->info.origin.position.y) / map_->info.resolution); }
-    double gridToWorldX(int gx) const { return map_->info.origin.position.x + (gx + 0.5) * map_->info.resolution; }
-    double gridToWorldY(int gy) const { return map_->info.origin.position.y + (gy + 0.5) * map_->info.resolution; }
-    bool inBounds(int x, int y) const { return x >= 0 && x < (int)map_->info.width && y >= 0 && y < (int)map_->info.height; }
+    int    worldToGridX(double x)  const { return static_cast<int>((x - map_->info.origin.position.x) / map_->info.resolution); }
+    int    worldToGridY(double y)  const { return static_cast<int>((y - map_->info.origin.position.y) / map_->info.resolution); }
+    double gridToWorldX(int gx)   const { return map_->info.origin.position.x + (gx + 0.5) * map_->info.resolution; }
+    double gridToWorldY(int gy)   const { return map_->info.origin.position.y + (gy + 0.5) * map_->info.resolution; }
+    bool   inBounds(int x, int y) const { return x >= 0 && x < (int)map_->info.width && y >= 0 && y < (int)map_->info.height; }
 
-    // ── Costmap & Path Planning ───────────────────────────────────────────────
-    
+    // ── Costmap ───────────────────────────────────────────────────────────────
+
     std::vector<int> buildCostGrid() const
     {
         int W = map_->info.width, H = map_->info.height;
-        int inflate_cells = static_cast<int>(std::ceil(robot_radius_m_ / map_->info.resolution));
+        int inflate_cells = static_cast<int>(std::ceil(robot_radius_m_      / map_->info.resolution));
         int penalty_cells = static_cast<int>(std::ceil((robot_radius_m_ + center_pref_m_) / map_->info.resolution));
 
         std::vector<int> grid(W * H, 0);
-
-        for (int i = 0; i < W * H; ++i) {
+        for (int i = 0; i < W * H; ++i)
             if (map_->data[i] == 100) grid[i] = 10000;
-        }
 
         std::vector<int> result = grid;
         for (int y = 0; y < H; ++y) {
             for (int x = 0; x < W; ++x) {
-                if (grid[y * W + x] != 10000) continue; 
-                
+                if (grid[y * W + x] != 10000) continue;
+
                 for (int dy = -penalty_cells; dy <= penalty_cells; ++dy) {
                     for (int dx = -penalty_cells; dx <= penalty_cells; ++dx) {
                         int nx = x + dx, ny = y + dy;
                         if (!inBounds(nx, ny)) continue;
-                        
+
                         double dist = std::hypot(dx, dy);
-                        int idx = ny * W + nx;
-                        
+                        int    idx  = ny * W + nx;
+
                         if (dist <= inflate_cells) {
-                            result[idx] = 255; 
+                            result[idx] = 255;
                         } else if (dist <= penalty_cells && result[idx] < 255) {
-                            double penalty_weight = 15.0; 
-                            int penalty = static_cast<int>(penalty_weight * (penalty_cells - dist));
+                            int penalty = static_cast<int>(wall_penalty_weight_ * (penalty_cells - dist));
                             result[idx] = std::max(result[idx], penalty);
                         }
                     }
@@ -123,6 +115,28 @@ private:
         }
         return result;
     }
+
+    // ── Costmap Publisher ─────────────────────────────────────────────────────
+
+    void publishCostmap(const std::vector<int>& cost_grid)
+    {
+        nav_msgs::msg::OccupancyGrid msg;
+        msg.header.stamp    = now();
+        msg.header.frame_id = map_->header.frame_id;
+        msg.info            = map_->info;
+
+        msg.data.resize(cost_grid.size());
+        for (size_t i = 0; i < cost_grid.size(); ++i) {
+            int v = cost_grid[i];
+            if      (v == 10000) msg.data[i] = 100;          
+            else if (v == 255)   msg.data[i] = 99;           
+            else if (v > 0)      msg.data[i] = std::clamp(v, 1, 98);  
+            else                 msg.data[i] = 0;            
+        }
+        costmap_pub_->publish(msg);
+    }
+
+    // ── Path Planning ─────────────────────────────────────────────────────────
 
     bool planPath(int sx, int sy, int gx, int gy, const std::vector<int>& cost_grid)
     {
@@ -156,8 +170,8 @@ private:
             bool operator>(const ANode& o) const { return f > o.f; }
         };
 
-        std::vector<float>  g_cost(W * H, 1e9f);
-        std::vector<int>    came_from(W * H, -1);
+        std::vector<float> g_cost(W * H, 1e9f);
+        std::vector<int>   came_from(W * H, -1);
         std::priority_queue<ANode, std::vector<ANode>, std::greater<ANode>> open;
 
         g_cost[s_idx] = 0.0f;
@@ -176,17 +190,22 @@ private:
                 int nx = cx + dx8[i], ny = cy + dy8[i];
                 if (!inBounds(nx, ny)) continue;
                 int n_idx = ny * W + nx;
-
                 if (cost_grid[n_idx] == 255) continue;
 
-                float terrain_penalty = cost_grid[n_idx] * 0.5f; 
+                // GÜNCELLEME 2: Ceza katsayısı 0.5f'den 2.5f'e çıkarıldı (merkeze yapışma)
+                float terrain_penalty = cost_grid[n_idx] * 2.5f;
                 float tg = g_cost[cur] + dc8[i] + terrain_penalty;
-                
+
                 if (tg < g_cost[n_idx]) {
                     came_from[n_idx] = cur;
                     g_cost[n_idx]    = tg;
                     float h = std::hypot(nx - gx, ny - gy);
-                    open.push({n_idx, tg + h});
+                    
+                    // GÜNCELLEME 1: Düz çizgi teşviki (Tie-breaker)
+                    float cross = std::abs((nx - sx) * (gy - sy) - (gx - sx) * (ny - sy));
+                    float dir_penalty = cross * 0.005f;
+
+                    open.push({n_idx, tg + h + dir_penalty});
                 }
             }
         }
@@ -199,11 +218,10 @@ private:
         }
         std::reverse(path_.begin(), path_.end());
 
-        // --- ROTA YUMUŞATMA (MOVING AVERAGE FILTER) ---
-        // Keskin A* köşelerini tıraşlayarak robotun salınımını önler
         if (path_.size() > 4) {
             std::vector<Pose2D> smoothed = path_;
-            int window = 2; // Daha güçlü yumuşatma için 3 veya 4 yapılabilir
+            // GÜNCELLEME 3: Smoothing penceresi daraltıldı (2'den 1'e)
+            int window = 1; 
             for (size_t i = window; i < path_.size() - window; ++i) {
                 double sum_x = 0, sum_y = 0;
                 for (int j = -window; j <= window; ++j) {
@@ -230,8 +248,8 @@ private:
         for (int y = 2; y < H - 2; ++y) {
             for (int x = 2; x < W - 2; ++x) {
                 int idx = y * W + x;
-                if (map_->data[idx] != 0)      continue;  
-                if (cost_grid[idx]  == 255)    continue;  
+                if (map_->data[idx] != 0)   continue;
+                if (cost_grid[idx]  == 255) continue;
 
                 bool is_frontier = false;
                 const int nx4[] = {-1,1,0,0};
@@ -243,10 +261,10 @@ private:
                 }
                 if (!is_frontier) continue;
 
-                double fx = gridToWorldX(x);
-                double fy = gridToWorldY(y);
+                double fx   = gridToWorldX(x);
+                double fy   = gridToWorldY(y);
                 double dist = std::hypot(fx - pose_.x, fy - pose_.y);
-                if (dist < 0.5) continue; 
+                if (dist < 0.5) continue;
 
                 double score = 1.0 * dist - 2.0 * unknown_count;
                 cands.push_back({fx, fy, score});
@@ -259,7 +277,7 @@ private:
                   [](const Candidate& a, const Candidate& b){ return a.score < b.score; });
 
         for (auto& c : cands) {
-            int gx = worldToGridX(c.wx), gy = worldToGridY(c.wy);
+            int gx  = worldToGridX(c.wx), gy = worldToGridY(c.wy);
             int key = gy * (int)map_->info.width + gx;
             if (blacklisted_goals_.count(key)) continue;
             out_x = c.wx; out_y = c.wy;
@@ -289,19 +307,20 @@ private:
         if (!map_ || !pose_ready_) return;
 
         auto cost_grid = buildCostGrid();
-        double tx, ty;
+        publishCostmap(cost_grid);  
 
+        double tx, ty;
         if (findBestFrontier(tx, ty, cost_grid)) {
             int sx = worldToGridX(pose_.x), sy = worldToGridY(pose_.y);
             int gx = worldToGridX(tx),      gy = worldToGridY(ty);
-            
+
             if (planPath(sx, sy, gx, gy, cost_grid)) {
                 RCLCPP_INFO(get_logger(), "New plan: %zu waypoints -> (%.2f, %.2f)", path_.size(), tx, ty);
                 publishPath();
             } else {
                 RCLCPP_WARN(get_logger(), "A* failed for frontier (%.2f, %.2f)", tx, ty);
                 int key = gy * (int)map_->info.width + gx;
-                blacklisted_goals_.insert(key); 
+                blacklisted_goals_.insert(key);
             }
         } else {
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,

@@ -223,7 +223,6 @@ Pose2D icp(const std::vector<Point2D>& source, const KdTree& tree)
     return delta;
 }
 
-
 Pose2D icp_point_to_line(const std::vector<Point2D>& source, const KdTree& tree)
 {
     Pose2D delta{0, 0, 0};
@@ -231,11 +230,19 @@ Pose2D icp_point_to_line(const std::vector<Point2D>& source, const KdTree& tree)
 
     std::vector<Point2D> pts = source;
 
+    // 1. DÜZELTME: Taramanın ağırlık merkezini (centroid) buluyoruz
+    double cx = 0.0, cy = 0.0;
+    for (const auto& p : pts) {
+        cx += p.x;
+        cy += p.y;
+    }
+    cx /= pts.size();
+    cy /= pts.size();
+
     for (int iter = 0; iter < 50; ++iter) {
-        double thresh    = 1.0 - iter * (0.5 / 50.0);
+        double thresh = 1.5 - iter * (0.5 / 50.0);
         double thresh_sq = thresh * thresh;
 
-        // Denklem sistemimiz: H * x = B
         double H[3][3] = {{0}}; 
         double B[3]    = {0};   
         
@@ -244,29 +251,25 @@ Pose2D icp_point_to_line(const std::vector<Point2D>& source, const KdTree& tree)
         for (auto& s : pts) {
             Point2D t1, t2;
             
-            // Eğer KD-Tree bize yüzey oluşturacak en yakın 2 noktayı dönerse:
             if (tree.nearestTwo(s, thresh_sq, t1, t2)) {
                 
-                // 1. Hedef yüzeyin normal vektörünü hesapla
                 double l_dx = t2.x - t1.x;
                 double l_dy = t2.y - t1.y;
                 double len = std::hypot(l_dx, l_dy);
                 
                 if (len < 1e-6) continue;
                 
-                // Vektörü 90 derece döndürüp normalize ediyoruz
                 double nx = -l_dy / len;
                 double ny =  l_dx / len;
 
-                // 2. Jacobian matrisi elemanları (A matrisi satırı)
                 double a1 = nx;
                 double a2 = ny;
-                double a3 = s.x * ny - s.y * nx; // Rotasyon etkisi
                 
-                // Hata metrigimiz (Noktanın doğruya olan dik uzaklığı)
+                // 2. DÜZELTME: Rotasyon etkisini (Jacobian) ağırlık merkezine göre hesaplıyoruz
+                double a3 = (s.x - cx) * ny - (s.y - cy) * nx; 
+                
                 double b_i = (t1.x - s.x) * nx + (t1.y - s.y) * ny;
 
-                // 3. Matrisleri biriktir (Accumulation)
                 H[0][0] += a1 * a1; H[0][1] += a1 * a2; H[0][2] += a1 * a3;
                 H[1][0] += a2 * a1; H[1][1] += a2 * a2; H[1][2] += a2 * a3;
                 H[2][0] += a3 * a1; H[2][1] += a3 * a2; H[2][2] += a3 * a3;
@@ -279,33 +282,34 @@ Pose2D icp_point_to_line(const std::vector<Point2D>& source, const KdTree& tree)
             }
         }
 
-        if (valid_pairs < 20) break; // Yeterli eşleşme yoksa dur
+        if (valid_pairs < 20) break;
 
         double X[3] = {0};
         
-        // Matrisi çözmeye çalış
         if (!solve3x3(H, B, X)) {
-            break; // Matris çözülemediyse iterasyonu bitir
+            break; 
         }
 
         double dx   = X[0];
         double dy   = X[1];
         double dyaw = X[2];
 
-        // Bulunan küçük sapmaları (delta) kaynak noktalara uygula
+        // 3. DÜZELTME: Bulunan küçük sapmaları ağırlık merkezine göre uyguluyoruz
         for (auto& p : pts) {
-            double nx_pt = p.x * std::cos(dyaw) - p.y * std::sin(dyaw) + dx;
-            double ny_pt = p.x * std::sin(dyaw) + p.y * std::cos(dyaw) + dy;
+            double px_c = p.x - cx;
+            double py_c = p.y - cy;
+            
+            double nx_pt = cx + px_c * std::cos(dyaw) - py_c * std::sin(dyaw) + dx;
+            double ny_pt = cy + px_c * std::sin(dyaw) + py_c * std::cos(dyaw) + dy;
+            
             p.x = nx_pt; 
             p.y = ny_pt;
         }
 
-        // Toplam sapmayı güncelle
         delta.x   += dx;
         delta.y   += dy;
         delta.yaw  = std::atan2(std::sin(delta.yaw + dyaw), std::cos(delta.yaw + dyaw));
 
-        // Eğer değişim çok küçüldüyse (yakınsama sağlandıysa) çık
         if (std::hypot(dx, dy) < 1e-4 && std::abs(dyaw) < 1e-4) break;
     }
     
@@ -369,67 +373,75 @@ private:
             initialized_ = true;
         }
     }
+void scanCb(const sensor_msgs::msg::LaserScan::SharedPtr msg)
+{
+    if (!initialized_) return;
 
-    void scanCb(const sensor_msgs::msg::LaserScan::SharedPtr msg)
-    {
-        if (!initialized_) return;
+    double dx   = odom_.x   - prev_.x;
+    double dy   = odom_.y   - prev_.y;
+    double dyaw = odom_.yaw - prev_.yaw;
 
-        double dx   = odom_.x   - prev_.x;
-        double dy   = odom_.y   - prev_.y;
-        double dyaw = odom_.yaw - prev_.yaw;
-
-        // FIX 3: dyaw normalize et
-        while (dyaw >  M_PI) dyaw -= 2.0 * M_PI;
-        while (dyaw < -M_PI) dyaw += 2.0 * M_PI;
-
-        Pose2D guess{
-            corrected_.x   + dx,
-            corrected_.y   + dy,
-            corrected_.yaw + dyaw
-        };
-
-        auto pts = scanToPoints(*msg, guess);
-        // Eski kod:
-        // Pose2D d = icp(pts, tree_);
-
-        // Yeni kod:
-        Pose2D d = icp_point_to_line(pts, tree_);
-        
-        corrected_.x   = guess.x + d.x;
-        corrected_.y   = guess.y + d.y;
-        corrected_.yaw = normalizeAngle(guess.yaw + d.yaw);
+    while (dyaw >  M_PI) dyaw -= 2.0 * M_PI;
+    while (dyaw < -M_PI) dyaw += 2.0 * M_PI;
 
 
-        prev_ = odom_;
+    double cyaw = corrected_.yaw;
+    double rdx  =  dx * std::cos(cyaw) + dy * std::sin(cyaw);  // odom delta → global
+    // Aslında odom zaten global frame'de geliyorsa bu gerekmez,
+    // ama corrected_ ile odom arasında açı farkı varsa:
+    double angle_diff = normalizeAngle(corrected_.yaw - odom_.yaw + dyaw);
+    // Daha güvenli: delta'yı corrected frame'e taşı
+    double gdx = dx * std::cos(corrected_.yaw - (odom_.yaw - dyaw))
+               - dy * std::sin(corrected_.yaw - (odom_.yaw - dyaw));
+    double gdy = dx * std::sin(corrected_.yaw - (odom_.yaw - dyaw))
+               + dy * std::cos(corrected_.yaw - (odom_.yaw - dyaw));
 
-        // Sadece yeterince uzak noktaları ekle
-        bool tree_dirty = false;
-        for (auto& p : pts) {
-            if (map_pts_.size() < MAP_PTS_MAX && isFarEnough(p)) {
-                map_pts_.push_back(p);
-                tree_dirty = true;
-            }
+    Pose2D guess{
+        corrected_.x + gdx,
+        corrected_.y + gdy,
+        normalizeAngle(corrected_.yaw + dyaw)
+    };
+    auto pts = scanToPoints(*msg, guess);
+
+    // FIX 2: Harita yeterliyse ICP yap, değilse sadece guess kullan
+    Pose2D d{0, 0, 0};
+    d = icp_point_to_line(pts, tree_);
+    
+
+    corrected_.x   = guess.x + d.x;
+    corrected_.y   = guess.y + d.y;
+    corrected_.yaw = normalizeAngle(guess.yaw + d.yaw);
+
+    prev_ = odom_;
+
+    // FIX 3: Noktaları corrected_ ile güncellendikten SONRA ekle
+    auto final_pts = scanToPoints(*msg, corrected_);
+    bool tree_dirty = false;
+    for (auto& p : final_pts) {
+        if (map_pts_.size() < MAP_PTS_MAX && isFarEnough(p)) {
+            map_pts_.push_back(p);
+            tree_dirty = true;
         }
-
-        // YENI EKLENEN: Sadece son noktalar kalsın
-        if (map_pts_.size() > MAP_PTS_MAX) {
-            map_pts_.erase(map_pts_.begin(), map_pts_.begin() + 3000);
-            tree_dirty = true; // Noktalar silindiği için ağaç yeniden kurulmalı
-        }
-
-        if (tree_dirty || tree_.empty())
-            tree_.build(map_pts_);
-
-        // Publish
-        geometry_msgs::msg::PoseStamped out;
-        out.header.stamp    = now();
-        out.header.frame_id = "odom";
-        out.pose.position.x = corrected_.x;
-        out.pose.position.y = corrected_.y;
-        out.pose.orientation.z = std::sin(corrected_.yaw / 2.0);
-        out.pose.orientation.w = std::cos(corrected_.yaw / 2.0);
-        pose_pub_->publish(out);
     }
+
+    if (map_pts_.size() > MAP_PTS_MAX) {
+        map_pts_.erase(map_pts_.begin(), map_pts_.begin() + 2000);
+        tree_dirty = true;
+    }
+
+    if (tree_dirty || tree_.empty())
+        tree_.build(map_pts_);
+
+    // Publish
+    geometry_msgs::msg::PoseStamped out;
+    out.header.stamp    = now();
+    out.header.frame_id = "odom";
+    out.pose.position.x = corrected_.x;
+    out.pose.position.y = corrected_.y;
+    out.pose.orientation.z = std::sin(corrected_.yaw / 2.0);
+    out.pose.orientation.w = std::cos(corrected_.yaw / 2.0);
+    pose_pub_->publish(out);
+}
 
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr  scan_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr      odom_sub_;

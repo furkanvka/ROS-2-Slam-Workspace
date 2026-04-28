@@ -3,20 +3,83 @@
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
+#include "std_srvs/srv/trigger.hpp"
 
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <limits>
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Yardımcı tipler
+// ─────────────────────────────────────────────────────────────────────────────
 
 struct Pose2D { double x, y, yaw; };
 
-enum class RecoveryState { NONE, BACKING_UP };
-
-static inline double normAngle(double a) {
+static inline double normAngle(double a)
+{
     while (a >  M_PI) a -= 2.0 * M_PI;
     while (a < -M_PI) a += 2.0 * M_PI;
     return a;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Sektörel Lidar Özeti  (frontal / sol-ön / sağ-ön ayrı ayrı)
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct LidarSector {
+    double front_min;      // ±15° içindeki en yakın mesafe
+    double left_min;       // 15°–60° içindeki en yakın mesafe
+    double right_min;      // −60° – −15° içindeki en yakın mesafe
+    double front_wide_min; // ±60° içindeki genel en yakın (collision check)
+};
+
+LidarSector parseSectors(const sensor_msgs::msg::LaserScan& scan)
+{
+    LidarSector s{1e9, 1e9, 1e9, 1e9};
+    for (size_t i = 0; i < scan.ranges.size(); ++i) {
+        float r = scan.ranges[i];
+        if (!std::isfinite(r) || r < scan.range_min || r > scan.range_max) continue;
+
+        float a = scan.angle_min + static_cast<float>(i) * scan.angle_increment;
+
+        if (std::fabs(a) <= 1.047f) {              // ±60°
+            s.front_wide_min = std::min(s.front_wide_min, static_cast<double>(r));
+            if (std::fabs(a) <= 0.262f)            // ±15°
+                s.front_min = std::min(s.front_min, static_cast<double>(r));
+            else if (a > 0.262f)                   // sol 15°–60°
+                s.left_min  = std::min(s.left_min,  static_cast<double>(r));
+            else                                   // sağ
+                s.right_min = std::min(s.right_min, static_cast<double>(r));
+        }
+    }
+    return s;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Trapezoidal hız rampası  (her döngüde çağrılır)
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct VelRamp {
+    double v_current = 0.0;
+    double w_current = 0.0;
+
+    void step(double v_target, double w_target,
+              double max_acc_v, double max_acc_w, double dt)
+    {
+        auto clamp_step = [](double cur, double tgt, double step) {
+            double diff = tgt - cur;
+            if (std::fabs(diff) <= step) return tgt;
+            return cur + std::copysign(step, diff);
+        };
+        v_current = clamp_step(v_current, v_target, max_acc_v * dt);
+        w_current = clamp_step(w_current, w_target, max_acc_w * dt);
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  PathFollowerNode
+// ─────────────────────────────────────────────────────────────────────────────
 
 class PathFollowerNode : public rclcpp::Node
 {
@@ -25,96 +88,136 @@ public:
     {
         using std::placeholders::_1;
 
-        // ── Nav2 RPP Tarzı Parametreler ───────────────────────────────────────
-        declare_parameter("stop_distance_m",       0.25);  
-        declare_parameter("lookahead_dist_m",      0.40);  
-        declare_parameter("goal_tolerance_m",      0.10);  
-        declare_parameter("max_linear_vel",        2.55);  
-        declare_parameter("min_linear_vel",        0.40);  
-        declare_parameter("max_angular_vel",       1.00);  
-        
-        // Regülasyon Parametreleri
-        declare_parameter("approach_dist_m",       1.50);  
-        declare_parameter("rotate_to_heading_ang", 0.80);  // 0.60'tan 0.80'e çıkarıldı (Daha esnek dönüş toleransı)
-        declare_parameter("regulated_vel_scaling", 0.35);  
+        // ── Parametreler ──────────────────────────────────────────────────────
+        declare_parameter("max_linear_vel",     0.50);  // m/s
+        declare_parameter("min_linear_vel",     0.08);  // m/s
+        declare_parameter("max_angular_vel",    1.20);  // rad/s
+        declare_parameter("max_acc_linear",     0.40);  // m/s²
+        declare_parameter("max_acc_angular",    1.50);  // rad/s²
 
-        // Stuck Parametreleri
-        declare_parameter("stuck_timeout_s",       10.0);  
-        declare_parameter("stuck_dist_m",          0.10);  
+        // Adaptive lookahead: L = base + k*v, clamp [min, max]
+        declare_parameter("lookahead_base_m",   0.35);
+        declare_parameter("lookahead_k",        0.40);  // L'yi hıza göre büyüt
+        declare_parameter("lookahead_min_m",    0.20);
+        declare_parameter("lookahead_max_m",    1.00);
 
-        stop_dist_m_     = get_parameter("stop_distance_m").as_double();
-        lookahead_dist_  = get_parameter("lookahead_dist_m").as_double();
-        goal_tol_        = get_parameter("goal_tolerance_m").as_double();
-        max_lin_         = get_parameter("max_linear_vel").as_double();
-        min_lin_         = get_parameter("min_linear_vel").as_double();
-        max_ang_         = get_parameter("max_angular_vel").as_double();
-        
-        approach_dist_   = get_parameter("approach_dist_m").as_double();
-        rotate_to_ang_   = get_parameter("rotate_to_heading_ang").as_double();
-        reg_vel_scaling_ = get_parameter("regulated_vel_scaling").as_double();
+        // Goal
+        declare_parameter("goal_tolerance_m",   0.10);
+        declare_parameter("heading_tolerance",  0.10);  // rad, hedefe varınca hizalama
 
-        stuck_timeout_   = get_parameter("stuck_timeout_s").as_double();
-        stuck_dist_      = get_parameter("stuck_dist_m").as_double();
+        // Obstacle / lidar
+        declare_parameter("stop_dist_m",        0.30);  // bu mesafenin altında dur
+        declare_parameter("slow_dist_m",        0.70);  // bu mesafeden itibaren yavaşla
+        declare_parameter("lateral_margin_m",   0.25);  // sol/sağ tehdit eşiği
+        declare_parameter("steer_away_gain",    0.60);  // yanal tehditten kaçış kazancı
 
+        // Stuck & recovery
+        declare_parameter("stuck_timeout_s",    6.0);
+        declare_parameter("stuck_dist_m",       0.08);
+        declare_parameter("backup_duration_s",  1.5);
+        declare_parameter("backup_vel",        -0.12);
+
+        loadParams();
+
+        // ── Pub / Sub ─────────────────────────────────────────────────────────
         path_sub_ = create_subscription<nav_msgs::msg::Path>(
             "/plan", 10, std::bind(&PathFollowerNode::pathCb, this, _1));
         pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
             "/corrected_pose", 10, std::bind(&PathFollowerNode::poseCb, this, _1));
         scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
-            "/a200_0000/sensors/lidar2d_0/scan", 10, std::bind(&PathFollowerNode::scanCb, this, _1));
+            "/a200_0000/sensors/lidar2d_0/scan", 10,
+            std::bind(&PathFollowerNode::scanCb, this, _1));
 
-        cmd_vel_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>("/a200_0000/cmd_vel", 10);
+        cmd_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>(
+            "/a200_0000/cmd_vel", 10);
 
-        // Timer 100ms'den 50ms'e çekildi (Overshoot önleme)
+        // Plan isteği için servis istemcisi (FrontierNode'a)
+        plan_client_ = create_client<std_srvs::srv::Trigger>("/plan_path");
+
+        // ── Kontrol döngüsü 20 Hz ─────────────────────────────────────────────
         timer_ = create_wall_timer(
             std::chrono::milliseconds(50),
             std::bind(&PathFollowerNode::controlLoop, this));
 
-        last_pose_time_ = now();
-        last_stuck_check_pose_ = {0, 0, 0};
+        RCLCPP_INFO(get_logger(), "PathFollowerNode hazır.");
     }
 
 private:
-    Pose2D  pose_{};
-    bool    pose_ready_  = false;
-    std::vector<Pose2D> path_;                   
+    // ── State ─────────────────────────────────────────────────────────────────
+    Pose2D pose_{};
+    bool   pose_ready_ = false;
 
-    bool   obstacle_ahead_ = false;
-    double closest_front_  = 1e9;
+    std::vector<Pose2D> path_;
+    size_t              progress_idx_ = 0;   // geride kalmış son waypoint indeksi
 
-    rclcpp::Time  last_pose_time_;
-    Pose2D        last_stuck_check_pose_{};
-    rclcpp::Time  last_moved_time_;
-    bool          stuck_check_init_ = false;
+    LidarSector sector_{1e9, 1e9, 1e9, 1e9};
+    bool        scan_ready_ = false;
 
-    RecoveryState recovery_state_ = RecoveryState::NONE;
-    double        recovery_turn_dir_ = 1.0;
-    rclcpp::Time  recovery_start_;
+    VelRamp ramp_;
 
-    rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr            path_sub_;
+    // Stuck detection
+    Pose2D       last_moved_pose_{};
+    rclcpp::Time last_moved_time_;
+    bool         stuck_init_ = false;
+
+    // Recovery
+    bool         in_recovery_  = false;
+    rclcpp::Time recovery_end_;
+
+    // Plan request cooldown
+    rclcpp::Time last_plan_req_time_;
+    bool         plan_req_sent_ = false;
+
+    // ── ROS handles ──────────────────────────────────────────────────────────
+    rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr             path_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
-    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr    scan_sub_;
-    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr  cmd_vel_pub_;
-    rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr     scan_sub_;
+    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr   cmd_pub_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr                plan_client_;
+    rclcpp::TimerBase::SharedPtr                                     timer_;
 
-    double stop_dist_m_, lookahead_dist_, goal_tol_;
+    // ── Parametreler ──────────────────────────────────────────────────────────
     double max_lin_, min_lin_, max_ang_;
-    double approach_dist_, rotate_to_ang_, reg_vel_scaling_;
-    double stuck_timeout_, stuck_dist_;
+    double max_acc_v_, max_acc_w_;
+    double lh_base_, lh_k_, lh_min_, lh_max_;
+    double goal_tol_, heading_tol_;
+    double stop_dist_, slow_dist_, lateral_margin_, steer_gain_;
+    double stuck_timeout_, stuck_dist_, backup_dur_, backup_vel_;
+
+    void loadParams()
+    {
+        max_lin_       = get_parameter("max_linear_vel").as_double();
+        min_lin_       = get_parameter("min_linear_vel").as_double();
+        max_ang_       = get_parameter("max_angular_vel").as_double();
+        max_acc_v_     = get_parameter("max_acc_linear").as_double();
+        max_acc_w_     = get_parameter("max_acc_angular").as_double();
+        lh_base_       = get_parameter("lookahead_base_m").as_double();
+        lh_k_          = get_parameter("lookahead_k").as_double();
+        lh_min_        = get_parameter("lookahead_min_m").as_double();
+        lh_max_        = get_parameter("lookahead_max_m").as_double();
+        goal_tol_      = get_parameter("goal_tolerance_m").as_double();
+        heading_tol_   = get_parameter("heading_tolerance").as_double();
+        stop_dist_     = get_parameter("stop_dist_m").as_double();
+        slow_dist_     = get_parameter("slow_dist_m").as_double();
+        lateral_margin_= get_parameter("lateral_margin_m").as_double();
+        steer_gain_    = get_parameter("steer_away_gain").as_double();
+        stuck_timeout_ = get_parameter("stuck_timeout_s").as_double();
+        stuck_dist_    = get_parameter("stuck_dist_m").as_double();
+        backup_dur_    = get_parameter("backup_duration_s").as_double();
+        backup_vel_    = get_parameter("backup_vel").as_double();
+    }
+
+    // ── Callbacks ─────────────────────────────────────────────────────────────
 
     void pathCb(const nav_msgs::msg::Path::SharedPtr msg)
     {
-        if (recovery_state_ != RecoveryState::NONE) return;
-
-        if (!path_.empty()) {
-            return; 
-        }
-
-        for (const auto& p : msg->poses) {
-            path_.push_back({p.pose.position.x, p.pose.position.y, 0.0});
-        }
-        
-        RCLCPP_INFO(get_logger(), "Yeni rota alindi ve kilitlendi. Hedef bitene veya engel cikana kadar baska rota alinmayacak.");
+        if (in_recovery_) return;
+        path_.clear();
+        progress_idx_ = 0;
+        for (const auto& ps : msg->poses)
+            path_.push_back({ps.pose.position.x, ps.pose.position.y, 0.0});
+        plan_req_sent_ = false;
+        RCLCPP_INFO(get_logger(), "Yeni rota: %zu waypoint.", path_.size());
     }
 
     void poseCb(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
@@ -126,162 +229,229 @@ private:
         pose_.yaw = std::atan2(2.0 * z * w, 1.0 - 2.0 * z * z);
         pose_ready_ = true;
 
-        if (!stuck_check_init_) {
-            last_stuck_check_pose_ = pose_;
-            last_moved_time_       = now();
-            stuck_check_init_      = true;
+        if (!stuck_init_) {
+            last_moved_pose_ = pose_;
+            last_moved_time_ = now();
+            stuck_init_      = true;
         }
     }
 
     void scanCb(const sensor_msgs::msg::LaserScan::SharedPtr msg)
     {
-        obstacle_ahead_ = false;
-        closest_front_  = 1e9;
-        
-        for (size_t i = 0; i < msg->ranges.size(); ++i) {
-            float r = msg->ranges[i];
-            if (r < msg->range_min || r > msg->range_max || std::isnan(r)) continue;
+        sector_    = parseSectors(*msg);
+        scan_ready_ = true;
+    }
 
-            float a = msg->angle_min + i * msg->angle_increment;
-            if (std::fabs(a) > 0.80) continue; 
+    // ── Yardımcılar ───────────────────────────────────────────────────────────
 
-            if (r < closest_front_) closest_front_ = r;
-            if (r < stop_dist_m_)   obstacle_ahead_ = true;
-        }
+    void publishStop()
+    {
+        ramp_.step(0.0, 0.0, max_acc_v_, max_acc_w_, 0.05);
+        // Tam durdurma — rampa sıfıra yakınsa doğrudan sıfırla
+        ramp_.v_current = 0.0;
+        ramp_.w_current = 0.0;
+        sendCmd(0.0, 0.0);
+    }
+
+    void sendCmd(double v, double w)
+    {
+        geometry_msgs::msg::TwistStamped cmd;
+        cmd.header.stamp    = now();
+        cmd.header.frame_id = "base_link";
+        cmd.twist.linear.x  = std::clamp(v, -max_lin_, max_lin_);
+        cmd.twist.angular.z = std::clamp(w, -max_ang_, max_ang_);
+        cmd_pub_->publish(cmd);
+    }
+
+    // Lidar engelinden kaynaklanan yanal sapma düzeltmesi
+    // Sağ taraf yakınsa → sola dön (+w), sol taraf yakınsa → sağa dön (−w)
+    double lateralSteerCorrection() const
+    {
+        if (!scan_ready_) return 0.0;
+        double correction = 0.0;
+        if (sector_.right_min < lateral_margin_)
+            correction += steer_gain_ * (1.0 - sector_.right_min / lateral_margin_);
+        if (sector_.left_min  < lateral_margin_)
+            correction -= steer_gain_ * (1.0 - sector_.left_min  / lateral_margin_);
+        return correction;
+    }
+
+    // Frontal mesafeye göre hız faktörü  [0, 1]
+    double obstacleVelFactor() const
+    {
+        if (!scan_ready_) return 1.0;
+        double d = sector_.front_min;
+        if (d <= stop_dist_) return 0.0;
+        if (d >= slow_dist_) return 1.0;
+        return (d - stop_dist_) / (slow_dist_ - stop_dist_);
     }
 
     bool isStuck()
     {
-        if (!stuck_check_init_) return false;
-        double moved = std::hypot(pose_.x - last_stuck_check_pose_.x,
-                                  pose_.y - last_stuck_check_pose_.y);
-        auto now_t = now();
+        if (!stuck_init_) return false;
+        double moved = std::hypot(pose_.x - last_moved_pose_.x,
+                                  pose_.y - last_moved_pose_.y);
         if (moved > stuck_dist_) {
-            last_stuck_check_pose_ = pose_;
-            last_moved_time_       = now_t;
+            last_moved_pose_ = pose_;
+            last_moved_time_ = now();
         }
-        double elapsed = (now_t - last_moved_time_).seconds();
-        return elapsed > stuck_timeout_;
+        return (now() - last_moved_time_).seconds() > stuck_timeout_;
     }
+
+    void requestNewPlan()
+    {
+        if (!plan_client_->service_is_ready()) return;
+        if (plan_req_sent_) return;
+
+        auto req = std::make_shared<std_srvs::srv::Trigger::Request>();
+        plan_client_->async_send_request(req,
+            [this](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture fut) {
+                auto res = fut.get();
+                if (res->success)
+                    RCLCPP_INFO(get_logger(), "Yeni plan alındı: %s", res->message.c_str());
+                else
+                    RCLCPP_WARN(get_logger(), "Plan isteği başarısız: %s", res->message.c_str());
+                plan_req_sent_ = false;  // tekrar deneyebilir
+            });
+        plan_req_sent_ = true;
+        RCLCPP_INFO(get_logger(), "Yeni plan istendi.");
+    }
+
+    // ── Ana Kontrol Döngüsü ───────────────────────────────────────────────────
 
     void controlLoop()
     {
         if (!pose_ready_) return;
 
-        geometry_msgs::msg::TwistStamped cmd;
-        cmd.header.stamp    = now();
-        cmd.header.frame_id = "base_link";
+        constexpr double DT = 0.05; // 20 Hz
 
-        if (recovery_state_ == RecoveryState::BACKING_UP) {
-            if ((now() - recovery_start_).seconds() < 1.5) {
-                cmd.twist.linear.x = -0.15; 
-                cmd.twist.angular.z = recovery_turn_dir_ * 0.8;
-                cmd_vel_pub_->publish(cmd);
-                return;
+        // ── 1. Recovery modu ─────────────────────────────────────────────────
+        if (in_recovery_) {
+            if (now() < recovery_end_) {
+                ramp_.step(backup_vel_, 0.0, max_acc_v_, max_acc_w_, DT);
+                sendCmd(ramp_.v_current, ramp_.w_current);
             } else {
-                recovery_state_ = RecoveryState::NONE;
+                in_recovery_ = false;
+                path_.clear();
+                progress_idx_ = 0;
+                last_moved_pose_ = pose_;
                 last_moved_time_ = now();
-                path_.clear(); 
+                RCLCPP_INFO(get_logger(), "Recovery bitti, yeni plan isteniyor.");
+                requestNewPlan();
             }
-        }
-
-        if (isStuck() && !path_.empty()) {
-            recovery_turn_dir_ = 1.0;
-            recovery_state_ = RecoveryState::BACKING_UP;
-            recovery_start_ = now();
             return;
         }
 
-        if (obstacle_ahead_) {
-            cmd.twist.linear.x  = 0.0;
-            cmd.twist.angular.z = (closest_front_ > 0.0) ? 0.7 : -0.7; 
-            cmd_vel_pub_->publish(cmd);
-            path_.clear(); 
+        // ── 2. Frontal çarpışma — acil dur ──────────────────────────────────
+        if (scan_ready_ && sector_.front_min <= stop_dist_ && !path_.empty()) {
+            publishStop();
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                "Engel: %.2f m — duruyorum.", sector_.front_min);
             return;
         }
 
+        // ── 3. Rota yok ──────────────────────────────────────────────────────
         if (path_.empty()) {
-            cmd_vel_pub_->publish(cmd); 
+            publishStop();
             return;
         }
 
-        // ── 1. En yakın noktayı bul ve geride kalan "hayalet" noktaları sil ──
-        if (!path_.empty()) {
-            size_t closest_idx = 0;
-            double min_dist = 1e9;
-            for (size_t i = 0; i < path_.size(); ++i) {
+        // ── 4. Stuck tespiti ─────────────────────────────────────────────────
+        if (isStuck()) {
+            RCLCPP_WARN(get_logger(), "Stuck! Recovery başlıyor.");
+            in_recovery_  = true;
+            recovery_end_ = now() + rclcpp::Duration::from_seconds(backup_dur_);
+            publishStop();
+            return;
+        }
+
+        // ── 5. Progress indeksini ilerlet ────────────────────────────────────
+        //    Robota en yakın waypoint'i bul, progress_idx_ geri gidemez
+        {
+            double best = 1e9;
+            size_t best_i = progress_idx_;
+            for (size_t i = progress_idx_; i < path_.size(); ++i) {
                 double d = std::hypot(path_[i].x - pose_.x, path_[i].y - pose_.y);
-                if (d < min_dist) {
-                    min_dist = d;
-                    closest_idx = i;
-                }
+                if (d < best) { best = d; best_i = i; }
             }
-            path_.erase(path_.begin(), path_.begin() + closest_idx);
+            progress_idx_ = best_i;
         }
 
-        // ── 2. Kalan rotanın son noktasına ulaşıldı mı? ──
-        if (!path_.empty() && std::hypot(path_.back().x - pose_.x, path_.back().y - pose_.y) < goal_tol_) {
+        // ── 6. Hedefe varış kontrolü ─────────────────────────────────────────
+        const Pose2D& goal = path_.back();
+        double dist_to_goal = std::hypot(goal.x - pose_.x, goal.y - pose_.y);
+        if (dist_to_goal < goal_tol_) {
+            publishStop();
             path_.clear();
-            cmd_vel_pub_->publish(cmd);
+            RCLCPP_INFO(get_logger(), "Hedefe ulaşıldı.");
+            requestNewPlan();
             return;
         }
-        
-        if (path_.empty()) { cmd_vel_pub_->publish(cmd); return; }
 
-        // ── 3. Lookahead (İleri Bakış) Noktasını Bulma ────────────────────────
+        // ── 7. Adaptive lookahead mesafesi ───────────────────────────────────
+        double v_now     = ramp_.v_current;
+        double lookahead = std::clamp(lh_base_ + lh_k_ * v_now, lh_min_, lh_max_);
+
+        // Engel varsa lookahead'i kısalt — temkinli davran
+        if (scan_ready_ && sector_.front_wide_min < slow_dist_)
+            lookahead = std::max(lh_min_, lookahead * (sector_.front_wide_min / slow_dist_));
+
+        // ── 8. Lookahead noktasını bul ───────────────────────────────────────
         size_t target_idx = path_.size() - 1;
-        for (size_t i = 0; i < path_.size(); ++i) {
-            if (std::hypot(path_[i].x - pose_.x, path_[i].y - pose_.y) >= lookahead_dist_) {
-                target_idx = i; break;
+        for (size_t i = progress_idx_; i < path_.size(); ++i) {
+            if (std::hypot(path_[i].x - pose_.x, path_[i].y - pose_.y) >= lookahead) {
+                target_idx = i;
+                break;
             }
         }
 
-        double tx2 = path_[target_idx].x;
-        double ty2 = path_[target_idx].y;
-        double dx = tx2 - pose_.x;
-        double dy = ty2 - pose_.y;
-        
-        double dist_to_final_goal = std::hypot(path_.back().x - pose_.x, path_.back().y - pose_.y);
-        double alpha = normAngle(std::atan2(dy, dx) - pose_.yaw);
-        double lookahead_l = std::hypot(dx, dy);
+        const Pose2D& tp = path_[target_idx];
+        double dx    = tp.x - pose_.x;
+        double dy    = tp.y - pose_.y;
+        double alpha = normAngle(std::atan2(dy, dx) - pose_.yaw);  // heading hatası
+        double L     = std::hypot(dx, dy);                         // gerçek mesafe
 
-        // ── 4. Rotate to Heading (Olduğun Yerde Dön) ──────────────────────────
-        if (std::fabs(alpha) > rotate_to_ang_) {
-            cmd.twist.linear.x = 0.0;
-            double rot_vel = std::clamp(1.5 * alpha, -max_ang_, max_ang_);
-            if (std::fabs(rot_vel) < 0.2) rot_vel = std::copysign(0.2, alpha);
-            cmd.twist.angular.z = rot_vel;
-            cmd_vel_pub_->publish(cmd);
-            return;
-        }
+        // ── 9. Pure Pursuit curvature → (v, ω) ──────────────────────────────
+        //    κ = 2·sin(α) / L   →   ω = v · κ
+        double curvature = (L > 1e-3) ? (2.0 * std::sin(alpha) / L) : 0.0;
 
-        // ── 5. Nav2 Pure Pursuit Matematiği (Curvature) ───────────────────────
-        double curvature = 0.0;
-        if (lookahead_l > 0.001) {
-            curvature = 2.0 * std::sin(alpha) / lookahead_l;
-        }
+        // ── 10. Hız profili ──────────────────────────────────────────────────
 
-        // ── 6. Regulated Linear Velocity (Hız Regülasyonu) ────────────────────
+        // a) Hedefe yaklaşırken yavaşla (lineer)
         double v_target = max_lin_;
+        if (dist_to_goal < slow_dist_)
+            v_target = max_lin_ * std::max(0.2, dist_to_goal / slow_dist_);
 
-        if (dist_to_final_goal < approach_dist_) {
-            v_target = max_lin_ * (dist_to_final_goal / approach_dist_);
-        }
+        // b) Yüksek eğride yavaşla — keskin köşe koruması
+        double abs_curv = std::fabs(curvature);
+        if (abs_curv > 0.5)
+            v_target *= std::max(0.3, 1.0 - 0.6 * (abs_curv - 0.5));
 
-        if (std::fabs(curvature) > 0.1) {
-            double safe_vel_for_curve = reg_vel_scaling_ / std::fabs(curvature);
-            v_target = std::min(v_target, safe_vel_for_curve);
-        }
+        // c) Frontal engel faktörü
+        double obs_factor = obstacleVelFactor();
+        v_target *= obs_factor;
 
-        cmd.twist.linear.x = std::clamp(v_target, min_lin_, max_lin_);
+        // d) Minimum hız (durana kadar) — çok küçük hız robot motorunu zorlar
+        if (v_target > 0.0 && v_target < min_lin_) v_target = min_lin_;
 
-        // ── 7. Açısal Hızı Hesapla (w = v * k) ────────────────────────────────
-        cmd.twist.angular.z = cmd.twist.linear.x * curvature;
-        cmd.twist.angular.z = std::clamp(cmd.twist.angular.z, -max_ang_, max_ang_);
+        double w_target = v_target * curvature;
 
-        cmd_vel_pub_->publish(cmd);
+        // e) Yanal duvardan kaçış — ω'ya eklenir
+        w_target += lateralSteerCorrection();
+        w_target  = std::clamp(w_target, -max_ang_, max_ang_);
+
+        // ── 11. Trapezoidal rampa ────────────────────────────────────────────
+        ramp_.step(v_target, w_target, max_acc_v_, max_acc_w_, DT);
+        sendCmd(ramp_.v_current, ramp_.w_current);
+
+        RCLCPP_DEBUG(get_logger(),
+            "v=%.2f w=%.2f α=%.2f L=%.2f lh=%.2f front=%.2f",
+            ramp_.v_current, ramp_.w_current,
+            alpha, L, lookahead, sector_.front_min);
     }
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv)
 {

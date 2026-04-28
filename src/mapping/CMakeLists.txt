@@ -11,6 +11,8 @@ find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
+
 
 # ─── Localization Node ───────────────────────
 add_executable(localization_node src/localization_node.cpp)
@@ -62,6 +64,7 @@ ament_target_dependencies(path_node
   geometry_msgs
   nav_msgs
   sensor_msgs
+  std_srvs
 )
 
 
@@ -80,6 +83,7 @@ ament_target_dependencies(frontier_node
   geometry_msgs
   nav_msgs
   sensor_msgs
+  std_srvs
 )
 
 # ─── Install ─────────────────────────────────
