@@ -1,110 +1,125 @@
-# ROS 2 Mapping Workspace
+# ROS 2 Autonomous Mapping & Exploration System
 
-A ROS 2 Jazzy workspace for robot mapping using occupancy grid mapping with Clearpath simulation.
+A ROS 2 Jazzy workspace for autonomous robot mapping, localization, and exploration using Clearpath A200 simulation in Gazebo.
 
 ## Overview
 
-This workspace contains a mapping package that processes sensor data to build an occupancy grid map. It integrates with Clearpath's Gazebo simulation environment.
+This project implements a complete autonomous navigation stack including:
+- **ICP-based Localization**: Corrects odometry drift using point-to-line ICP with KD-Tree
+- **Occupancy Grid Mapping**: Real-time map building with log-odds update
+- **Frontier-based Exploration**: Autonomous exploration of unknown environments
+- **A* Path Planning**: Optimal pathfinding with wall penalty zones
+- **Pure Pursuit Path Following**: Smooth path tracking with obstacle avoidance
 
-## Package Structure
+## Features
 
-```
-src/
-└── mapping/
-    ├── CMakeLists.txt          # Build configuration
-    ├── package.xml             # Package manifest
-    ├── include/                # Header files
-    └── src/
-        └── Occupancy.cpp       # Occupancy grid mapping node
-```
+- Real-time SLAM using 2D LiDAR
+- Procedurally generated maze environments
+- Stuck detection and recovery maneuvers
+- Adaptive velocity profiling
+- Wall-aware path planning with penalty zones
+- Complete simulation integration with Clearpath Gazebo
+
+## Tech Stack
+
+| Category | Technology |
+|----------|------------|
+| Framework | ROS 2 Jazzy |
+| Languages | C++17, Python 3 |
+| Simulation | Gazebo (gz-sim) |
+| Build | CMake, colcon |
+| Robot | Clearpath A200 |
 
 ## Dependencies
 
+### System Requirements
 - ROS 2 Jazzy
-- Clearpath packages
-- Gazebo (for simulation)
-- colcon (build tool)
+- Gazebo gz-sim
+- colcon build tool
 
 ### ROS 2 Packages
+- `rclcpp`, `geometry_msgs`, `nav_msgs`, `sensor_msgs`, `std_srvs`
+- `clearpath_gz` (Clearpath simulation)
 
-- `rclcpp` - ROS 2 C++ client library
-- `geometry_msgs` - Geometric message types
-- `nav_msgs` - Navigation message types (OccupancyGrid, etc.)
-- `sensor_msgs` - Sensor message types (LaserScan, etc.)
-- `clearpath_gz` - Clearpath Gazebo simulation
-
-## Building
+## Installation
 
 ```bash
+# Clone the repository
+cd ~/ros2_ws/src
+git clone <repository-url> map
+
 # Source ROS 2
 source /opt/ros/jazzy/setup.bash
+source ~/clearpath/setup.bash
 
-# Build the workspace
+# Build
+cd ~/ros2_ws
 colcon build --symlink-install
 ```
 
-## Running
+## Usage
 
-Use the provided script for easy launch:
-
+### Quick Start
 ```bash
 ./run.sh
 ```
 
-Or manually:
-
+### Manual Launch
 ```bash
-# Source ROS 2 and workspace
 source /opt/ros/jazzy/setup.bash
+source ~/clearpath/setup.bash
+colcon build --symlink-install
 source install/setup.bash
+ros2 launch mapping launch.py
+```
 
-# Launch simulation
-ros2 launch clearpath_gz simulation.launch.py \
-  x:=-3.3 y:=3.3 \
-  world:=/home/furkan/Documents/new/worlds/generated_maze \
-  rviz:=true \
-  use_sim_time:=true
-
-# Run mapping node (in another terminal)
-ros2 run mapping Occupancy
+### Generate Custom Maze
+```bash
+python a.py --cells-x 6  # Generates a 6x6 maze
 ```
 
 ## Nodes
 
-### Occupancy
+### localization_node
+- **Purpose**: ICP-based pose correction
+- **Input**: `/a200_0000/sensors/lidar2d_0/scan`, `/a200_0000/platform/odom/filtered`
+- **Output**: `/corrected_pose`
 
-Processes sensor data to generate an occupancy grid map.
+### mapping_node
+- **Purpose**: Occupancy grid map building
+- **Input**: `/a200_0000/sensors/lidar2d_0/scan`, `/corrected_pose`
+- **Output**: `/map`
 
-**Subscriptions:**
-- Laser scan data (for obstacle detection)
-- Odometry (for robot pose)
+### frontier_node
+- **Purpose**: Autonomous exploration and path planning
+- **Input**: `/map`, `/corrected_pose`
+- **Output**: `/plan`, `/frontier_costmap`
 
-**Publications:**
-- Occupancy grid map (`/map` topic)
+### path_node
+- **Purpose**: Path following with obstacle avoidance
+- **Input**: `/plan`, `/corrected_pose`, `/a200_0000/sensors/lidar2d_0/scan`
+- **Output**: `/a200_0000/cmd_vel`
 
-## Simulation
+## Project Structure
 
-The workspace includes integration with Clearpath's Gazebo simulation:
-- Simulated robot with LiDAR sensors
-- Generated maze world environment
-- RViz visualization support
+```
+map/
+├── src/mapping/           # Main package
+│   ├── launch/launch.py   # System launch file
+│   └── src/               # Node implementations
+├── worlds/                # Gazebo world files
+├── a.py                   # Maze generator
+├── run.sh                 # Build & launch script
+└── legacy/                # Previous implementation
+```
 
-## Development
+## Testing
 
-### Linting
-
-The package includes ament lint tools:
-- `cppcheck` - Static code analysis
-- `lint_cmake` - CMake linting
-- `uncrustify` - Code formatting
-- `xmllint` - XML validation
-
-To run linters:
 ```bash
 colcon test --packages-select mapping
 ```
 
 ## License
 
+Apache-2.0
 
-## Author
